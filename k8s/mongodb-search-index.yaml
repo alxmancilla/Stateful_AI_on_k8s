@@ -1,0 +1,58 @@
+---
+# TLS certificate for the mongot (search) node.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: mdbc-rs-search-cert
+  namespace: mongodb
+spec:
+  secretName: mdbc-rs-search-cert
+  duration: 8760h
+  issuerRef:
+    name: mongodb-ca-issuer
+    kind: Issuer
+  usages:
+    - server auth
+    - client auth
+  # The operator names the mongot StatefulSet pod/service with a "-0-" cluster
+  # index (mdbc-rs-search-0-0 in the mdbc-rs-search-0-svc headless service).
+  # mongod connects to searchIndexManagementHostAndPort:
+  #   mdbc-rs-search-0-0.mdbc-rs-search-0-svc.mongodb.svc.cluster.local:27028
+  # so the cert MUST be valid for that FQDN (and the proxy service) or the
+  # mongod->mongot management channel fails TLS verification (code 125).
+  dnsNames:
+    - mdbc-rs-search-0-0
+    - mdbc-rs-search-0-0.mdbc-rs-search-0-svc.mongodb.svc.cluster.local
+    - mdbc-rs-search-0-svc
+    - mdbc-rs-search-0-svc.mongodb.svc.cluster.local
+    - "*.mdbc-rs-search-0-svc.mongodb.svc.cluster.local"
+    - mdbc-rs-search-0-proxy-svc
+    - mdbc-rs-search-0-proxy-svc.mongodb.svc.cluster.local
+---
+# MongoDBSearch deploys a mongot node that provides $search and $vectorSearch
+# for the mdbc-rs replica set. Embeddings are generated client-side by the
+# agent (Voyage AI), so automated embedding is not enabled here.
+#
+# The actual search/vector indexes on agent_memory.messages are created by
+# scripts/create_indexes.py once this resource reaches the Running phase.
+apiVersion: mongodb.com/v1
+kind: MongoDBSearch
+metadata:
+  name: mdbc-rs
+  namespace: mongodb
+spec:
+  source:
+    mongodbResourceRef:
+      name: mdbc-rs
+  security:
+    tls:
+      certificateKeySecretRef:
+        name: mdbc-rs-search-cert
+  clusters:
+    - resourceRequirements:
+        requests:
+          cpu: "500m"
+          memory: 1Gi
+        limits:
+          cpu: "2"
+          memory: 2Gi

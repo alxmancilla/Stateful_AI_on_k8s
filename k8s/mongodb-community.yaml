@@ -1,0 +1,157 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mongodb
+---
+# Self-signed issuer used only to bootstrap a local CA.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: selfsigned-issuer
+  namespace: mongodb
+spec:
+  selfSigned: {}
+---
+# Local certificate authority for the demo (mongod <-> mongot TLS).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: mongodb-ca
+  namespace: mongodb
+spec:
+  isCA: true
+  commonName: mongodb-demo-ca
+  secretName: mongodb-ca
+  duration: 8760h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: selfsigned-issuer
+    kind: Issuer
+---
+# CA-backed issuer that signs the server/search certificates.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: mongodb-ca-issuer
+  namespace: mongodb
+spec:
+  ca:
+    secretName: mongodb-ca
+---
+# TLS certificate for the mongod replica set members.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: mdbc-rs-server-cert
+  namespace: mongodb
+spec:
+  secretName: mdbc-rs-server-cert
+  duration: 8760h
+  issuerRef:
+    name: mongodb-ca-issuer
+    kind: Issuer
+  usages:
+    - server auth
+    - client auth
+  dnsNames:
+    - mdbc-rs-svc
+    - mdbc-rs-svc.mongodb.svc.cluster.local
+    - "*.mdbc-rs-svc"
+    - "*.mdbc-rs-svc.mongodb.svc.cluster.local"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mdb-admin-user-password
+  namespace: mongodb
+type: Opaque
+stringData:
+  password: "Demo-Admin-Passw0rd"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mdb-user-password
+  namespace: mongodb
+type: Opaque
+stringData:
+  password: "Demo-User-Passw0rd"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mdbc-rs-search-sync-source-password
+  namespace: mongodb
+type: Opaque
+stringData:
+  password: "Demo-Sync-Passw0rd"
+---
+apiVersion: mongodbcommunity.mongodb.com/v1
+kind: MongoDBCommunity
+metadata:
+  name: mdbc-rs
+  namespace: mongodb
+spec:
+  members: 3
+  type: ReplicaSet
+  version: "8.2.0"
+  featureCompatibilityVersion: "8.2"
+  security:
+    authentication:
+      modes: ["SCRAM"]
+    tls:
+      enabled: true
+      certificateKeySecretRef:
+        name: mdbc-rs-server-cert
+      caConfigMapRef:
+        name: mongodb-ca-cm
+  users:
+    - name: admin-user
+      db: admin
+      passwordSecretRef:
+        name: mdb-admin-user-password
+      roles:
+        - { name: root, db: admin }
+      scramCredentialsSecretName: admin-user-scram
+    - name: mdb-user
+      db: admin
+      passwordSecretRef:
+        name: mdb-user-password
+      roles:
+        - { name: readWrite, db: agent_memory }
+        - { name: clusterMonitor, db: admin }
+      scramCredentialsSecretName: mdb-user-scram
+      connectionStringSecretName: agent-mongodb-connection
+    - name: search-sync-source
+      db: admin
+      passwordSecretRef:
+        name: mdbc-rs-search-sync-source-password
+      roles:
+        - { name: searchCoordinator, db: admin }
+        - { name: clusterMonitor, db: admin }
+      scramCredentialsSecretName: search-sync-source-scram
+  statefulSet:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: mongod
+              resources:
+                requests: { cpu: "250m", memory: 512Mi }
+                limits: { cpu: "1", memory: 1Gi }
+            - name: mongodb-agent
+              resources:
+                requests: { cpu: "100m", memory: 128Mi }
+                limits: { cpu: "500m", memory: 256Mi }
+      volumeClaimTemplates:
+        - metadata:
+            name: data-volume
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            storageClassName: standard
+            resources:
+              requests:
+                storage: 2Gi

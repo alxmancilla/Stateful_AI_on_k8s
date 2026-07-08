@@ -1,0 +1,31 @@
+# MongoDB Controllers for Kubernetes (MCK) operator - Helm values.
+#
+# MongoDB Search / Vector Search on Community Edition is provided by the MCK
+# operator (open source), which manages both the MongoDBCommunity replica set
+# and the MongoDBSearch (mongot) resource. This file is applied by setup.sh:
+#
+#   helm repo add mongodb https://mongodb.github.io/helm-charts
+#   helm upgrade --install mongodb-kubernetes mongodb/mongodb-kubernetes \
+#     --namespace mongodb --create-namespace \
+#     -f k8s/mongodb-operator.yaml
+#
+# The operator watches the "mongodb" namespace only, keeping the footprint
+# small enough for a 16GB minikube.
+
+operator:
+  watchNamespace: mongodb
+  # Keep the controller lightweight for local clusters.
+  resources:
+    requests:
+      cpu: "100m"
+      memory: 256Mi
+    limits:
+      cpu: "500m"
+      memory: 512Mi
+
+# Community-only install: the Ops Manager / AppDB controllers are not needed.
+mongodb:
+  name: mongodb-kubernetes
+
+# Custom resource definitions are installed by the chart.
+installCRDs: true

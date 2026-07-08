@@ -1,0 +1,10 @@
+# Pinned dependencies for the stateful agent image.
+pymongo==4.10.1
+dnspython==2.7.0
+voyageai==0.3.2
+langchain-core==0.3.29
+langchain-openai==0.2.14
+langchain-anthropic==0.3.1
+fastapi==0.115.6
+uvicorn==0.34.0
+pydantic==2.10.4

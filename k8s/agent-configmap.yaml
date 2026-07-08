@@ -1,0 +1,35 @@
+---
+# Non-secret runtime configuration for the agent.
+#
+# Secret values (VOYAGE_API_KEY, AZURE_GROVE_API_KEY) are provided via the
+# "agent-secrets" Secret, which setup.sh creates from your environment. The
+# MongoDB connection string comes from the operator-generated
+# "agent-mongodb-connection" Secret (key: connectionString.standard).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-config
+  namespace: mongodb
+data:
+  DB_NAME: "agent_memory"
+  COLLECTION_NAME: "messages"
+  VECTOR_INDEX: "vector_index"
+  TEXT_INDEX: "text_index"
+  EMBEDDING_DIM: "1024"
+  VOYAGE_MODEL: "voyage-3"
+  VOYAGE_RERANK_MODEL: "rerank-2.5"
+  # Voyage requests route through the MongoDB Atlas Embedding and Reranking API
+  # by default; Atlas model API keys are rejected by the native voyageai.com
+  # host. Set to https://api.voyageai.com/v1 only for a native voyageai.com key.
+  VOYAGE_API_BASE: "https://ai.mongodb.com/v1"
+  # LLM routing (overridable per-environment). Provider: openai | anthropic.
+  LLM_PROVIDER: "openai"
+  LLM_MODEL_NAME: "gpt-5.5"
+  AZURE_OPENAI_API_VERSION: "2024-06-01"
+  # Retrieval tuning.
+  RECENT_TURNS: "5"
+  HYBRID_TOP_K: "10"
+  RERANK_TOP_N: "3"
+  PORT: "8080"
+  # TLS CA used to verify the mongod endpoint (mounted from mongodb-ca-cm).
+  MONGODB_TLS_CA_FILE: "/etc/mongodb-ca/ca.crt"

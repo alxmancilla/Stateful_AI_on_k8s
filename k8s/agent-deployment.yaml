@@ -1,0 +1,79 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stateful-agent
+  namespace: mongodb
+  labels:
+    app: stateful-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stateful-agent
+  template:
+    metadata:
+      labels:
+        app: stateful-agent
+    spec:
+      containers:
+        - name: agent
+          image: stateful-agent:latest
+          imagePullPolicy: IfNotPresent
+          args: ["serve"]
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: agent-config
+            - secretRef:
+                name: agent-secrets
+          env:
+            - name: MONGODB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: agent-mongodb-connection
+                  key: connectionString.standard
+          volumeMounts:
+            - name: mongodb-ca
+              mountPath: /etc/mongodb-ca
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "100m"
+              memory: 256Mi
+            limits:
+              cpu: "500m"
+              memory: 512Mi
+      volumes:
+        - name: mongodb-ca
+          configMap:
+            name: mongodb-ca-cm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stateful-agent
+  namespace: mongodb
+  labels:
+    app: stateful-agent
+spec:
+  type: ClusterIP
+  selector:
+    app: stateful-agent
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
