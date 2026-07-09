@@ -11,7 +11,7 @@ LOCAL_PORT="${LOCAL_PORT:-8080}"
 BASE="http://127.0.0.1:${LOCAL_PORT}"
 SESSION="${SESSION_ID:-meetup-demo}"
 
-C_HDR='\033[1;36m'; C_CMD='\033[1;33m'; C_OK='\033[1;32m'; C_OFF='\033[0m'
+C_HDR='\033[1;36m'; C_CMD='\033[1;33m'; C_OK='\033[1;32m'; C_ERR='\033[1;31m'; C_OFF='\033[0m'
 PF_PID=""
 
 log()  { printf "\n${C_HDR}=== %s ===${C_OFF}\n" "$*"; }
@@ -35,10 +35,17 @@ log "Connecting to the agent (kubectl port-forward)"
 kubectl -n "$NS" port-forward svc/stateful-agent "${LOCAL_PORT}:80" \
   >/tmp/agent-pf.log 2>&1 &
 PF_PID=$!
-for _ in $(seq 1 30); do
-  curl -sf "${BASE}/health" >/dev/null 2>&1 && break
+ready=0
+for _ in $(seq 1 60); do
+  if curl -sf "${BASE}/health" >/dev/null 2>&1; then ready=1; break; fi
   sleep 1
 done
+if [ "$ready" -ne 1 ]; then
+  printf "\n${C_ERR}ERROR: agent not reachable at ${BASE} after 60s.${C_OFF}\n" >&2
+  printf "The pod may still be starting. Check, then re-run this script:\n" >&2
+  printf "  minikube status\n  kubectl -n %s get pods\n  kubectl -n %s logs deploy/stateful-agent\n  cat /tmp/agent-pf.log\n" "$NS" "$NS" >&2
+  exit 1
+fi
 run "curl -s ${BASE}/health | PP ."
 note "Agent reachable. Session id: ${SESSION}"
 pause
