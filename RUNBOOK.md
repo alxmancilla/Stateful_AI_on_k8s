@@ -77,7 +77,9 @@ bash scripts/chaos.sh
 Talking points as it runs:
 
 1. Stores a fact and reads it back.
-2. **Deletes `mdbc-rs-0`** with no grace period — "pull the plug on a DB node."
+2. **Resolves and deletes the current PRIMARY** with no grace period — "pull
+   the plug on the DB node that's serving writes." (Falls back to `mdbc-rs-0`
+   if the primary can't be resolved.)
 3. The StatefulSet recreates the pod; wait for the replica set to report
    `Running`. Data is on a `PersistentVolumeClaim` and replicated.
 4. Replays the query — **the fact is still there.**

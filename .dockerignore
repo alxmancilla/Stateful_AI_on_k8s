@@ -1,0 +1,26 @@
+# Keep the build context small and prevent local secrets from being sent to the
+# Docker daemon. The Dockerfile only needs agent/ and scripts/create_indexes.py.
+
+# Local secrets: never send real API keys to the daemon.
+.env
+.env.example
+
+# Version control and CI
+.git
+.gitignore
+.github
+
+# Docs (not needed at runtime)
+README.md
+RUNBOOK.md
+
+# Python caches / virtualenvs
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/

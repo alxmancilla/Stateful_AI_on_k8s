@@ -151,6 +151,7 @@ narrated walkthrough with recovery tips.
 ├── RUNBOOK.md             # presenter how-to for running the live demo
 ├── .env.example           # copy to .env and fill in your API keys
 ├── .gitignore             # keeps .env and Python caches out of git
+├── .dockerignore          # keeps .env, .git, docs, caches out of the build context
 ├── agent/
 │   ├── main.py            # FastAPI + CLI entrypoint, Settings, LLM wiring
 │   ├── memory.py          # MongoDB CRUD + recent/semantic/hybrid retrieval
@@ -231,7 +232,8 @@ kubectl -n mongodb exec -it deploy/stateful-agent -- python main.py chat
 `scripts/chaos.sh`:
 
 1. Stores a memorable fact through the agent and reads it back.
-2. Deletes a MongoDB replica-set pod (`mdbc-rs-0`) with no grace period.
+2. Resolves the current replica-set **primary** and deletes that pod with no
+   grace period (falls back to `mdbc-rs-0` if the primary can't be resolved).
 3. Watches the StatefulSet recreate the pod and waits for the replica set to
    report `Running` again.
 4. Replays the query — the fact is still there because it is persisted on a

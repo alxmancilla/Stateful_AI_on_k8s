@@ -1,0 +1,11 @@
+Harden chaos demo, add .dockerignore, sync docs
+
+- chaos.sh: resolve and delete the actual replica-set PRIMARY instead of
+  hardcoding mdbc-rs-0 (mongosh->mongo fallback, warning-robust parse,
+  safe mdbc-rs-0 default). Validated live against a non-rs-0 primary.
+- Add root .dockerignore to keep .env, .git, docs, and caches out of the
+  Docker build context.
+- README.md: update chaos section for primary detection; add .dockerignore
+  to project structure.
+- RUNBOOK.md: narration updated for the primary-kill step.
+- .env.example: fix stale demo/.env path to repo-root .env.

@@ -46,6 +46,32 @@ chat() {
     -d "{\"session_id\":\"${SESSION}\",\"message\":$1}"
 }
 
+# Resolve the current replica-set PRIMARY to a pod name. The primary's host looks
+# like ``mdbc-rs-0.mdbc-rs-svc...``, so the leading label is the pod name. Tries
+# ``mongosh`` then ``mongo`` inside the mongod container, and falls back to
+# ``${STS}-0`` if detection fails so the demo still proceeds.
+find_primary() {
+  local pw out pod shell_bin=""
+  pw="$(kubectl -n "$NS" get secret mdb-admin-user-password \
+        -o jsonpath='{.data.password}' 2>/dev/null | base64 --decode 2>/dev/null || true)"
+  shell_bin="$(kubectl -n "$NS" exec "${STS}-0" -c mongod -- sh -c \
+        'command -v mongosh || command -v mongo' 2>/dev/null | tr -d '\r' || true)"
+  if [ -n "$pw" ] && [ -n "$shell_bin" ]; then
+    # mongosh may print a benign EACCES warning to stdout before the result, so
+    # extract just the ``${STS}-N`` pod label from the primary host rather than
+    # trusting the first line.
+    out="$(kubectl -n "$NS" exec "${STS}-0" -c mongod -- "$shell_bin" \
+          --quiet --tls --tlsAllowInvalidCertificates \
+          -u admin-user -p "$pw" --authenticationDatabase admin \
+          --eval 'db.hello().primary' 2>/dev/null | tr -d '\r' || true)"
+    pod="$(printf '%s\n' "$out" | grep -oE "${STS}-[0-9]+" | head -1 || true)"
+  fi
+  case "$pod" in
+    ${STS}-[0-9]*) printf '%s' "$pod" ;;
+    *) printf '%s' "${STS}-0" ;;
+  esac
+}
+
 # --- 0. Connect --------------------------------------------------------------
 log "Connecting to the agent"
 start_pf
@@ -65,8 +91,9 @@ run "kubectl -n ${NS} get pods -l app=${STS}-svc -o wide"
 pause
 
 # --- 3. Kill a pod -----------------------------------------------------------
-log "3. Delete a MongoDB pod to simulate a node/pod failure"
-VICTIM="${STS}-0"
+log "3. Delete the PRIMARY MongoDB pod to simulate a node/pod failure"
+VICTIM="$(find_primary)"
+note "Current primary resolved to: ${VICTIM}"
 warn "Deleting pod ${VICTIM} ..."
 run "kubectl -n ${NS} delete pod ${VICTIM} --grace-period=0 --wait=false"
 note "Watching the StatefulSet recreate it (Ctrl-C the watch once Running)..."
