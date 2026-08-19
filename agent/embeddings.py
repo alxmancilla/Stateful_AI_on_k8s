@@ -13,6 +13,19 @@ from typing import List
 
 import voyageai
 
+DEFAULT_VOYAGE_API_BASE = "https://ai.mongodb.com/v1"
+
+
+def build_voyage_client(api_key: str, base_url: str) -> voyageai.Client:
+    """Construct a Voyage AI client routed at ``base_url``.
+
+    voyageai 0.3.2 has no ``base_url`` client parameter, so the module-level
+    global is set; Atlas model API keys are rejected by the api.voyageai.com
+    host. Centralized here so embeddings and rerank share one construction path.
+    """
+    voyageai.api_base = base_url
+    return voyageai.Client(api_key=api_key)
+
 
 class VoyageEmbeddings:
     """Thin wrapper around the Voyage AI embeddings API."""
@@ -25,19 +38,15 @@ class VoyageEmbeddings:
         base_url: str | None = None,
     ) -> None:
         self.api_key = api_key or os.environ["VOYAGE_API_KEY"]
-        self.model = model or os.environ.get("VOYAGE_MODEL", "voyage-3")
+        self.model = model or os.environ.get("VOYAGE_MODEL", "voyage-4")
         self.dimensions = dimensions or int(os.environ.get("EMBEDDING_DIM", "1024"))
         self.base_url = base_url or os.environ.get(
-            "VOYAGE_API_BASE", "https://ai.mongodb.com/v1"
+            "VOYAGE_API_BASE", DEFAULT_VOYAGE_API_BASE
         )
 
     @cached_property
     def _client(self) -> voyageai.Client:
-        # Route calls through the MongoDB Atlas endpoint by default. voyageai
-        # 0.3.2 has no base_url client parameter, so the module-level global is
-        # set; Atlas model API keys are rejected by the api.voyageai.com host.
-        voyageai.api_base = self.base_url
-        return voyageai.Client(api_key=self.api_key)
+        return build_voyage_client(self.api_key, self.base_url)
 
     def embed_query(self, text: str) -> List[float]:
         """Embed a single query string."""

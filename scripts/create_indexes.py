@@ -6,6 +6,9 @@ report a ``READY`` / queryable status:
 * ``vector_index`` - vector search on ``embedding`` (cosine, 1024 dims).
 * ``text_index``   - BM25 full-text search on ``content`` (standard analyzer).
 
+The supporting b-tree index on ``(session_id, turn)`` is not created here; it
+is built at agent startup by ``MongoMemory.ensure_indexes`` in agent/memory.py.
+
 Run inside the cluster (it needs network access to ``mongot``), e.g.:
 
     kubectl exec deploy/stateful-agent -n mongodb -- python create_indexes.py

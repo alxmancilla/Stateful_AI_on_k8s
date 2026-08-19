@@ -1,0 +1,11 @@
+# Test-only dependencies (not installed into the agent image).
+#
+#   python3 -m pip install -r requirements-dev.txt
+#   pytest tests/ -v
+#
+# The suite is hermetic by default: an in-process mongomock backend runs the
+# turn-counter, unique-index, and clamp tests with no MongoDB and no network.
+# Set TEST_MONGODB_URI to run against a real replica set instead, which also
+# unlocks the concurrency test that needs true server-side atomicity.
+pytest==8.4.2
+mongomock==4.3.0

@@ -42,6 +42,12 @@ kill %1                                      # demo.sh opens its own forward
 
 > Leave the cluster running. Do **not** re-run `setup.sh` during the talk.
 
+> **Version note:** the replica set is pinned to MongoDB **`8.2`** (major/LTS)
+> in `k8s/mongodb-community.yaml`. Do **not** bump `spec.version` to a minor
+> release (e.g. `8.3`) before or during the talk — the operator uses the
+> `OnDelete` update strategy, and an FCV-unaware bump can wedge a member in a
+> version split. See README "MongoDB version policy" for the safe procedure.
+
 ---
 
 ## On stage, part 1 — the guided demo
@@ -119,6 +125,7 @@ Tuning knobs (via env / `.env`):
 | Search returns nothing                    | Confirm `mongot`: `kubectl -n mongodb get pods -l app=mdbc-rs-search-svc`. |
 | Voyage 401 / APIError                     | Wrong key type — must be an Atlas model key. See README troubleshooting. |
 | Port already in use                       | `LOCAL_PORT=8090 bash scripts/demo.sh`.                              |
+| One MongoDB member stuck / CR `Pending`   | Version split from an unsafe bump. Patch the StatefulSet image back to `8.2.0` and delete that member's pod **+** PVC to re-sync. See README "MongoDB version policy". |
 
 Have a browser tab with the README "Troubleshooting" section open as backup.
 

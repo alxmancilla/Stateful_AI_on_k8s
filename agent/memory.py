@@ -12,11 +12,17 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo import ASCENDING, DESCENDING, ReturnDocument, MongoClient
 from pymongo.collection import Collection
+from pymongo.errors import OperationFailure
 
 from embeddings import VoyageEmbeddings
 from search import VoyageReranker, build_rankfusion_pipeline
+
+# Upper bound on how many recent turns a single read may request, so a large
+# client-supplied ``n`` (e.g. via the unauthenticated ``/memory`` route) cannot
+# trigger an unbounded scan.
+MAX_RECENT = 100
 
 
 def get_client(uri: str, ca_file: Optional[str] = None) -> MongoClient:
@@ -38,27 +44,59 @@ class MongoMemory:
         reranker: VoyageReranker,
         vector_index: str = "vector_index",
         text_index: str = "text_index",
+        counters: Optional[Collection] = None,
     ) -> None:
         self.collection = collection
         self.embeddings = embeddings
         self.reranker = reranker
         self.vector_index = vector_index
         self.text_index = text_index
+        # Per-session turn sequences live in a sibling collection so the counter
+        # can be advanced atomically, independent of the message documents.
+        self.counters = (
+            counters if counters is not None else collection.database["counters"]
+        )
 
     def _next_turn(self, session_id: str) -> int:
-        last = self.collection.find_one(
-            {"session_id": session_id}, sort=[("turn", DESCENDING)]
-        )
-        return (last["turn"] + 1) if last else 0
+        """Atomically reserve the next turn number for ``session_id``.
 
-    def save_message(self, session_id: str, role: str, content: str) -> Dict[str, Any]:
-        """Embed ``content`` and persist a memory document."""
+        Uses ``findOneAndUpdate`` with ``$inc`` (upserting on first use) so
+        concurrent writers to the same session each receive a distinct,
+        monotonically increasing turn value with no read-then-write race.
+
+        The turn is reserved before the message is embedded and inserted, so a
+        failure later in ``save_message`` burns that turn: the sequence stays
+        strictly increasing and never duplicates, but may contain gaps. Reads
+        order by ``turn``, so gaps are harmless.
+        """
+        doc = self.counters.find_one_and_update(
+            {"_id": session_id},
+            {"$inc": {"seq": 1}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        return doc["seq"] - 1
+
+    def save_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        embedding: Optional[List[float]] = None,
+    ) -> Dict[str, Any]:
+        """Embed ``content`` and persist a memory document.
+
+        A precomputed ``embedding`` may be supplied to avoid re-embedding text
+        that was already embedded for retrieval in the same turn.
+        """
         document = {
             "_id": str(uuid.uuid4()),
             "session_id": session_id,
             "role": role,
             "content": content,
-            "embedding": self.embeddings.embed_query(content),
+            "embedding": embedding
+            if embedding is not None
+            else self.embeddings.embed_query(content),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "turn": self._next_turn(session_id),
         }
@@ -66,7 +104,12 @@ class MongoMemory:
         return document
 
     def get_recent(self, session_id: str, n: int = 5) -> List[Dict[str, Any]]:
-        """Return the last ``n`` turns in chronological order."""
+        """Return the last ``n`` turns in chronological order.
+
+        ``n`` is clamped to ``[1, MAX_RECENT]`` so a large or non-positive
+        client-supplied value cannot request an unbounded read.
+        """
+        n = max(1, min(n, MAX_RECENT))
         cursor = (
             self.collection.find(
                 {"session_id": session_id}, {"embedding": 0}
@@ -106,10 +149,19 @@ class MongoMemory:
         return list(self.collection.aggregate(pipeline))
 
     def hybrid_search(
-        self, session_id: str, query: str, top_k: int = 10
+        self,
+        session_id: str,
+        query: str,
+        top_k: int = 10,
+        query_vector: Optional[List[float]] = None,
     ) -> List[Dict[str, Any]]:
-        """Combined ``$vectorSearch`` + ``$search`` via ``$rankFusion``."""
-        query_vector = self.embeddings.embed_query(query)
+        """Combined ``$vectorSearch`` + ``$search`` via ``$rankFusion``.
+
+        A precomputed ``query_vector`` may be supplied to avoid re-embedding a
+        query that was already embedded in the same turn.
+        """
+        if query_vector is None:
+            query_vector = self.embeddings.embed_query(query)
         pipeline = build_rankfusion_pipeline(
             query_vector=query_vector,
             query_text=query,
@@ -127,7 +179,19 @@ class MongoMemory:
         return self.reranker.rerank(query, candidates, top_n=top_n)
 
     def ensure_indexes(self) -> None:
-        """Create the supporting b-tree indexes used for recent-history reads."""
-        self.collection.create_index(
-            [("session_id", ASCENDING), ("turn", DESCENDING)]
-        )
+        """Create the supporting b-tree indexes used for recent-history reads.
+
+        The ``(session_id, turn)`` index is unique so that even if a turn value
+        were ever reused, the duplicate insert is rejected rather than accepted
+        silently. If a legacy collection already holds duplicate pairs (written
+        before the atomic counter existed), the unique build fails; fall back to
+        a non-unique index so startup is not blocked.
+
+        This b-tree index is created here (at agent startup), separately from
+        the search/vector indexes built by ``scripts/create_indexes.py``.
+        """
+        keys = [("session_id", ASCENDING), ("turn", DESCENDING)]
+        try:
+            self.collection.create_index(keys, unique=True)
+        except OperationFailure:
+            self.collection.create_index(keys)

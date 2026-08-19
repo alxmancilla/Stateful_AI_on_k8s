@@ -16,6 +16,8 @@ from typing import Any, Dict, List
 
 import voyageai
 
+from embeddings import DEFAULT_VOYAGE_API_BASE, build_voyage_client
+
 logger = logging.getLogger("agent.search")
 
 
@@ -99,16 +101,12 @@ class VoyageReranker:
         self.api_key = api_key or os.environ["VOYAGE_API_KEY"]
         self.model = model or os.environ.get("VOYAGE_RERANK_MODEL", "rerank-2.5")
         self.base_url = base_url or os.environ.get(
-            "VOYAGE_API_BASE", "https://ai.mongodb.com/v1"
+            "VOYAGE_API_BASE", DEFAULT_VOYAGE_API_BASE
         )
 
     @cached_property
     def _client(self) -> voyageai.Client:
-        # Route calls through the MongoDB Atlas endpoint by default. voyageai
-        # 0.3.2 has no base_url client parameter, so the module-level global is
-        # set; Atlas model API keys are rejected by the api.voyageai.com host.
-        voyageai.api_base = self.base_url
-        return voyageai.Client(api_key=self.api_key)
+        return build_voyage_client(self.api_key, self.base_url)
 
     def rerank(
         self, query: str, candidates: List[Dict[str, Any]], top_n: int = 3

@@ -16,7 +16,7 @@ data:
   VECTOR_INDEX: "vector_index"
   TEXT_INDEX: "text_index"
   EMBEDDING_DIM: "1024"
-  VOYAGE_MODEL: "voyage-3"
+  VOYAGE_MODEL: "voyage-4"
   VOYAGE_RERANK_MODEL: "rerank-2.5"
   # Voyage requests route through the MongoDB Atlas Embedding and Reranking API
   # by default; Atlas model API keys are rejected by the native voyageai.com

@@ -52,6 +52,10 @@ called over the network:
 * **The agent** is a small FastAPI service. Memory lives entirely in MongoDB,
   so the agent pod itself is stateless and disposable.
 
+The replica set is pinned to the **`8.2` major (LTS) release** — see
+[MongoDB version policy](#mongodb-version-policy) for why, and the safe upgrade
+path if you ever need a newer version.
+
 ---
 
 ## Prerequisites
@@ -152,6 +156,7 @@ narrated walkthrough with recovery tips.
 ├── .env.example           # copy to .env and fill in your API keys
 ├── .gitignore             # keeps .env and Python caches out of git
 ├── .dockerignore          # keeps .env, .git, docs, caches out of the build context
+├── requirements-dev.txt   # test-only deps (pytest, mongomock); not in the image
 ├── agent/
 │   ├── main.py            # FastAPI + CLI entrypoint, Settings, LLM wiring
 │   ├── memory.py          # MongoDB CRUD + recent/semantic/hybrid retrieval
@@ -165,11 +170,13 @@ narrated walkthrough with recovery tips.
 │   ├── mongodb-search-index.yaml # MongoDBSearch (mongot) + its TLS cert
 │   ├── agent-configmap.yaml      # non-secret agent configuration
 │   └── agent-deployment.yaml     # agent Deployment + Service
-└── scripts/
-    ├── setup.sh           # one-shot, idempotent provisioning
-    ├── create_indexes.py  # creates + waits for the search/vector indexes
-    ├── demo.sh            # guided, keypress-paced live walkthrough
-    └── chaos.sh           # pod-failure / persistence demonstration
+├── scripts/
+│   ├── setup.sh           # one-shot, idempotent provisioning
+│   ├── create_indexes.py  # creates + waits for the search/vector indexes
+│   ├── demo.sh            # guided, keypress-paced live walkthrough
+│   └── chaos.sh           # pod-failure / persistence demonstration
+└── tests/
+    └── test_memory_turns.py  # hermetic memory-layer tests (mongomock default)
 ```
 
 ---
@@ -186,11 +193,16 @@ Each conversational turn is one document in `agent_memory.messages`:
   "session_id": "meetup-demo",
   "role": "user | assistant",
   "content": "the message text",
-  "embedding": [0.01, -0.02, ...],   // 1024-dim, voyage-3
+  "embedding": [0.01, -0.02, ...],   // 1024-dim, voyage-4
   "timestamp": "2026-07-05T12:00:00Z",
   "turn": 0                            // monotonic per session
 }
 ```
+
+Turn numbers come from an atomic per-session counter kept in a sibling
+`agent_memory.counters` collection (`findOneAndUpdate` + `$inc`), and
+`(session_id, turn)` is a unique index — so turns stay collision-free even
+under concurrent writes.
 
 ### Retrieval flow (per `/chat` turn)
 
@@ -225,6 +237,115 @@ curl -s localhost:8080/chat -H 'content-type: application/json' \
 kubectl -n mongodb exec -it deploy/stateful-agent -- python main.py chat
 ```
 
+### MongoDB version policy
+
+The replica set is pinned in `k8s/mongodb-community.yaml`:
+
+```yaml
+version: "8.2.0"
+featureCompatibilityVersion: "8.2"
+```
+
+**Stay on `8.2`.** From MongoDB 8.2 onward there are two release tracks:
+*major* (LTS) releases like `8.0` and `8.2`, and *minor* releases like `8.3`
+that ship incremental features for specific use cases (Search, Vector Search,
+Queryable Encryption). This demo's search runs on `mongot` + the Voyage/Atlas
+APIs and needs nothing from the minor track, so `8.2` is the stable target.
+
+Two rules make ad-hoc version bumps risky, and caused a live upgrade to wedge
+during development:
+
+* **Every upgrade *and downgrade* step needs both a binary change and an FCV
+  change**, and you cannot skip minor releases (e.g. `8.2 → 8.3`, never
+  straight to a later minor).
+* The StatefulSet uses the `OnDelete` update strategy, so a `spec.version`
+  change only takes effect when each pod is manually deleted. Bumping the
+  binary without also advancing FCV — then trying to roll back — can leave one
+  member on newer on-disk data than its binary, which the operator cannot
+  reconcile.
+
+If you ever must move to a newer version, do it deliberately:
+
+1. Start healthy on `8.2` with FCV `8.2`.
+2. Raise `spec.version`; because of `OnDelete`, delete pods **one at a time**
+   (secondaries first, primary last), waiting for each to rejoin `2/2`.
+3. **Only after all members are on the new binary**, raise
+   `featureCompatibilityVersion`.
+4. To roll back: **lower FCV first**, *then* step the binary down — never the
+   reverse.
+
+If a member does get stuck in a version split, the recovery is to patch the
+StatefulSet image back to the good version and wipe just that member's PVC so
+it re-syncs cleanly from the healthy majority.
+
+---
+
+## Tests
+
+The `tests/` suite covers the memory layer's turn counter, unique-index
+enforcement, and recent-read clamp. It is **hermetic by default**: with no
+`TEST_MONGODB_URI` set it runs against an in-process `mongomock` backend, so it
+needs no MongoDB and no network.
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+pytest tests/ -v
+```
+
+To also run the concurrency test (which needs true server-side atomicity),
+point `TEST_MONGODB_URI` at a real replica set — e.g. a port-forward to the
+demo primary:
+
+```bash
+kubectl -n mongodb port-forward pod/mdbc-rs-0 27018:27017 &
+export TEST_MONGODB_URI="mongodb://admin-user:<pw>@127.0.0.1:27018/admin?tls=true&tlsAllowInvalidCertificates=true&directConnection=true"
+pytest tests/ -v
+```
+
+`mongomock` and `pytest` are test-only (in `requirements-dev.txt`) and are not
+installed into the agent image.
+
+---
+
+## Scope & non-goals
+
+This is a **local, runnable demo of a production-style architecture pattern**
+for durable agent memory on Kubernetes — not a production deployment. It shows
+the *shape* of a real system (operator-managed replica set, hybrid retrieval,
+reranking, a stateless agent, secret/config separation) so you can see how the
+pieces fit, but it deliberately omits the operational controls a production
+system needs. Called out explicitly so nothing here is mistaken for hardened:
+
+* **Scaling** — the agent runs `replicas: 1` with no HorizontalPodAutoscaler,
+  PodDisruptionBudget, or multi-replica validation.
+* **Write concurrency** — turn numbers are assigned by an atomic per-session
+  counter (`MongoMemory._next_turn()` uses `findOneAndUpdate` with `$inc` on a
+  sibling `counters` collection), and `(session_id, turn)` is a **unique**
+  index, so concurrent writes to the same `session_id` cannot collide on a
+  `turn` value. What the demo does *not* exercise is running the agent at
+  `replicas > 1` under real concurrent load (see scaling above).
+* **Secrets** — the demo MongoDB passwords are **hardcoded** in
+  `k8s/mongodb-community.yaml`. Real deployments would source these from a
+  secret manager and never commit them.
+* **Backup / DR** — there is no backup, point-in-time recovery, or restore
+  procedure. Replica-set replication (what `chaos.sh` demonstrates) provides
+  failover durability, **not** a backup.
+* **Security hardening** — no NetworkPolicy, dedicated ServiceAccount/RBAC
+  scoping, pod security context, or ingress/edge-TLS pattern. The agent HTTP
+  API is unauthenticated; `session_id` is a client-asserted string, so queries
+  are session-scoped but there is no tenant security boundary.
+* **Observability** — logs and `/health` only; no metrics, tracing, or
+  dashboards.
+* **Testing** — a hermetic memory-layer test suite exists (`tests/`, runs
+  offline via `mongomock`; see [Tests](#tests)), but there is no wired-up CI
+  pipeline, load testing, or RAG evaluation.
+* **Memory lifecycle** — no TTL, summarization, compaction, retention policy,
+  or tenant isolation for stored turns.
+
+In a talk, frame it as: *"a local demo of the architecture pattern; a
+production deployment would add backup, observability, security hardening,
+scaling, and operational controls."*
+
 ---
 
 ## Chaos demo (what it proves)
@@ -258,6 +379,12 @@ kubectl -n mongodb exec -it deploy/stateful-agent -- python main.py chat
   (`kubectl -n cert-manager get pods`) before re-running setup.
 * **Not enough resources** — free host RAM or lower the replica set to 1
   member in `k8s/mongodb-community.yaml` (`spec.members: 1`).
+* **One member stuck after a version change / CR stays `Pending`** — likely a
+  version split from an unsafe upgrade (see
+  [MongoDB version policy](#mongodb-version-policy)). Patch the StatefulSet
+  `mongod` image back to the good version and delete that member's pod **and**
+  its PVC so it re-syncs from the healthy majority; the other members and all
+  data are untouched.
 * **Voyage `401` / `APIError` on embed or rerank** — the `VOYAGE_API_KEY` must
   be a **MongoDB Atlas model API key** used against `https://ai.mongodb.com/v1`
   (the default). A native `pa-…` voyageai.com key requires setting

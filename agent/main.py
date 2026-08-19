@@ -14,7 +14,7 @@ import os
 import sys
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel
 
@@ -165,9 +165,18 @@ class Agent:
     def respond(self, session_id: str, message: str) -> Dict[str, Any]:
         recent = self.memory.get_recent(session_id, n=self.settings.recent_turns)
         context: List[Dict[str, Any]] = []
+        # Embed the user message once and reuse it for both retrieval and
+        # storage, avoiding a second Voyage call for identical text. If the
+        # embedding (or retrieval) fails, fall back to recent turns only and let
+        # save_message re-embed when persisting.
+        message_vector: Optional[List[float]] = None
         try:
+            message_vector = self.memory.embeddings.embed_query(message)
             candidates = self.memory.hybrid_search(
-                session_id, message, top_k=self.settings.hybrid_top_k
+                session_id,
+                message,
+                top_k=self.settings.hybrid_top_k,
+                query_vector=message_vector,
             )
             context = self.memory.rerank(
                 message, candidates, top_n=self.settings.rerank_top_n
@@ -178,7 +187,7 @@ class Agent:
         prompt = render_prompt(context=context, recent=recent, message=message)
         reply = self.llm.invoke(prompt).content
 
-        self.memory.save_message(session_id, "user", message)
+        self.memory.save_message(session_id, "user", message, embedding=message_vector)
         self.memory.save_message(session_id, "assistant", reply)
         return {"session_id": session_id, "reply": reply, "context_used": context}
 
@@ -207,7 +216,9 @@ def build_app(agent: Agent):
     @app.post("/rerank")
     def rerank(req: SearchRequest) -> Dict[str, Any]:
         candidates = agent.memory.hybrid_search(req.session_id, req.query, req.top_k)
-        reranked = agent.memory.rerank(req.query, candidates, top_n=3)
+        reranked = agent.memory.rerank(
+            req.query, candidates, top_n=agent.settings.rerank_top_n
+        )
         return {"before": candidates, "after": reranked}
 
     @app.get("/memory/{session_id}")
