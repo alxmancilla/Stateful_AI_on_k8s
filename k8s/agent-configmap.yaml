@@ -31,5 +31,12 @@ data:
   HYBRID_TOP_K: "10"
   RERANK_TOP_N: "3"
   PORT: "8080"
+  # Memory lifecycle (both disabled by default; the demo keeps all history).
+  # MEMORY_TTL_SECONDS > 0 builds a TTL index on created_at to auto-expire turns.
+  # MAX_TURNS_PER_SESSION > 0 trims older turns per session on write.
+  MEMORY_TTL_SECONDS: "0"
+  MAX_TURNS_PER_SESSION: "0"
+  # Max plan->act->observe tool-calling iterations per /chat turn.
+  MAX_TOOL_ITERS: "4"
   # TLS CA used to verify the mongod endpoint (mounted from mongodb-ca-cm).
   MONGODB_TLS_CA_FILE: "/etc/mongodb-ca/ca.crt"

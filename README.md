@@ -220,7 +220,9 @@ under concurrent writes.
 
 | Method | Path                     | Purpose                                   |
 |--------|--------------------------|-------------------------------------------|
+| GET    | `/`                      | demo web UI (chat / search / rerank)      |
 | GET    | `/health`                | liveness / readiness                      |
+| GET    | `/metrics`               | Prometheus-format in-process counters     |
 | POST   | `/chat`                  | full RAG turn, persists both messages     |
 | POST   | `/search`                | `mode: hybrid` or `vector` retrieval only |
 | POST   | `/rerank`                | show candidates before vs. after rerank   |
@@ -230,6 +232,10 @@ under concurrent writes.
 
 ```bash
 kubectl -n mongodb port-forward svc/stateful-agent 8080:80 &
+
+# Web UI (MongoDB look-and-feel): open http://localhost:8080/ in a browser —
+# tabs for chat, hybrid/vector search, and before/after rerank.
+
 curl -s localhost:8080/chat -H 'content-type: application/json' \
   -d '{"session_id":"s1","message":"Hello, remember I like Rust."}' | jq .
 
@@ -334,13 +340,19 @@ system needs. Called out explicitly so nothing here is mistaken for hardened:
   scoping, pod security context, or ingress/edge-TLS pattern. The agent HTTP
   API is unauthenticated; `session_id` is a client-asserted string, so queries
   are session-scoped but there is no tenant security boundary.
-* **Observability** — logs and `/health` only; no metrics, tracing, or
-  dashboards.
+* **Observability** — a `/metrics` endpoint exposes Prometheus-format
+  in-process counters (requests by route/outcome, messages saved by role,
+  retrieval skips, uptime); counters are process-local and reset on restart.
+  There is still no tracing, no dashboards, and no shared multi-replica
+  registry.
 * **Testing** — a hermetic memory-layer test suite exists (`tests/`, runs
   offline via `mongomock`; see [Tests](#tests)), but there is no wired-up CI
   pipeline, load testing, or RAG evaluation.
-* **Memory lifecycle** — no TTL, summarization, compaction, retention policy,
-  or tenant isolation for stored turns.
+* **Memory lifecycle** — turns carry a BSON `created_at` and the agent can
+  auto-expire them via an optional TTL index (`MEMORY_TTL_SECONDS`) and cap
+  per-session history (`MAX_TURNS_PER_SESSION`); both are **disabled by
+  default** so the demo keeps all history. There is still no summarization,
+  compaction, or tenant isolation for stored turns.
 
 In a talk, frame it as: *"a local demo of the architecture pattern; a
 production deployment would add backup, observability, security hardening,

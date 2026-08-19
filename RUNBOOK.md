@@ -1,8 +1,14 @@
 # Presenter Runbook — Stateful AI on Kubernetes
 
-A step-by-step guide for running this demo live during a tech talk. It assumes
-you have already read `README.md`. Total on-stage time is ~8–10 minutes once
-the cluster is up.
+The live-demo companion to `TALK.md` ("Building Production-Style Agent Memory
+for AI Workloads on Kubernetes"). Use this to run the demo on stage; use
+`TALK.md` for the slide-by-slide narrative and talking points. It assumes you
+have already read `README.md`. Total on-stage time is ~8–10 minutes once the
+cluster is up.
+
+The demo backs **Section 7** of the talk and reinforces its core thesis — *the
+agent is stateless; the database is the agent's brain.* The beats below map to
+the talk sections in parentheses so you can cross-reference while presenting.
 
 ---
 
@@ -52,6 +58,31 @@ kill %1                                      # demo.sh opens its own forward
 
 ## On stage, part 1 — the guided demo
 
+Two ways to present, matching **TALK.md Section 7** (the live demo). Pick one, or
+open the UI first for the visual hook, then drop to `demo.sh` for the pipeline
+internals.
+
+### Option A — the web UI (visual, streaming; TALK.md §5, §7)
+
+```bash
+kubectl -n mongodb port-forward svc/stateful-agent 8080:80 &
+# open http://127.0.0.1:8080/  (Chat / Search / Rerank tabs, session-id field)
+```
+
+Narration beats:
+
+1. **Teach a fact** — e.g. "my project deadline is next Friday." Reply **streams
+   token-by-token** over SSE. Expand **Sources & Tools** to show the agent called
+   `get_current_time` + `save_fact` — the **plan→act→observe tool loop** (TALK §5),
+   bounded by `MAX_TOOL_ITERS`.
+2. **Recall** — new question ("when is my deadline again?"). Show the retrieved
+   **memory sources with rerank scores** in the panel (TALK §4).
+3. **Rerank tab** — run a query and show the `before` vs `after` ordering flip.
+4. **`/metrics`** — `curl -s localhost:8080/metrics | grep agent_tool_calls_total`
+   shows the tool invocation counters ticked up (TALK §6, observability).
+
+### Option B — the guided CLI walkthrough (pipeline internals)
+
 ```bash
 bash scripts/demo.sh
 ```
@@ -59,22 +90,28 @@ bash scripts/demo.sh
 Narration beats (each ends with an Enter press):
 
 1. **Connect** — a `port-forward` to the in-cluster agent Service. Point out the
-   agent pod is stateless; all state lives in MongoDB.
+   agent pod is stateless; all state lives in MongoDB (TALK §2).
 2. **Teach three facts** — name/company, tech stack, language preference. Each
-   turn is embedded and written to MongoDB as it happens.
+   turn is embedded and written to MongoDB as it happens; the atomic per-session
+   counter assigns collision-free `turn` numbers (TALK §3).
 3. **Inspect memory** — `/memory/<session>` shows the raw persisted turns.
    "This is the durable state — rows in a local MongoDB replica set."
 4. **Hybrid search** — `$rankFusion` blends `$vectorSearch` (semantic) and
-   `$search` (BM25). Then the same query in **pure vector** mode — call out how
-   the ordering differs.
+   `$search` (BM25) in one aggregation. Then the same query in **pure vector**
+   mode — call out how the ordering differs (TALK §4).
 5. **Rerank** — Voyage `rerank-2.5` (via the Atlas API) re-scores the fused
-   candidates. Show the `before` vs `after` ordering flip.
+   candidates. Show the `before` vs `after` ordering flip — *retrieval is a
+   funnel: cheap-and-broad, then expensive-and-sharp.*
 6. **Memory-grounded answer** — ask "what's my name and preferred language?".
    The agent answers from retrieved long-term memory, not the prompt.
 
 ---
 
-## On stage, part 2 — chaos / durability
+## On stage, part 2 — chaos / durability (TALK §2, §6)
+
+Proves the talk's central split: *StatefulSet for the data, Deployment for the
+compute.* Kill the database node serving writes and the memory survives; restart
+the agent and it has forgotten nothing — because it never held state.
 
 ```bash
 bash scripts/chaos.sh
@@ -103,16 +140,30 @@ curl -s localhost:8080/chat -H 'content-type: application/json' \
   -d '{"session_id":"live","message":"Remember I like Rust."}' | jq .reply
 ```
 
+Show the **SSE stream** raw (tokens + tool events; TALK §1, §5):
+
+```bash
+curl -sN localhost:8080/chat/stream -H 'content-type: application/json' \
+  -d '{"session_id":"live","message":"What time is it right now?"}'
+```
+
+Show the **observability** surface (TALK §6):
+
+```bash
+curl -s localhost:8080/metrics | grep -E 'agent_(requests|tool_calls|messages)'
+```
+
 Interactive CLI inside the pod:
 
 ```bash
 kubectl -n mongodb exec -it deploy/stateful-agent -- python main.py chat
 ```
 
-Tuning knobs (via env / `.env`):
+Tuning knobs (via env / `.env` / ConfigMap):
 
 * `SESSION_ID` — use a fresh id for a clean slate per run.
 * `LOCAL_PORT` — change if `8080` is taken.
+* `MAX_TOOL_ITERS` — the tool-loop leash (TALK §5); default `4`.
 
 ---
 
@@ -125,6 +176,9 @@ Tuning knobs (via env / `.env`):
 | Search returns nothing                    | Confirm `mongot`: `kubectl -n mongodb get pods -l app=mdbc-rs-search-svc`. |
 | Voyage 401 / APIError                     | Wrong key type — must be an Atlas model key. See README troubleshooting. |
 | Port already in use                       | `LOCAL_PORT=8090 bash scripts/demo.sh`.                              |
+| Web UI blank / 404 at `/`                 | Assets ship in the image under `static/`; re-check the pod is the latest rollout: `kubectl -n mongodb rollout status deploy/stateful-agent`. |
+| Streaming (`/chat/stream`) hangs          | Fall back to non-streaming `/chat` or the UI Search/Rerank tabs; check `kubectl -n mongodb logs deploy/stateful-agent --tail=30`. |
+| Tool loop never fires / no `agent_tool_calls_total` | The turn may have answered from context without needing a tool — ask it to *recall* or *remember* something explicitly. |
 | One MongoDB member stuck / CR `Pending`   | Version split from an unsafe bump. Patch the StatefulSet image back to `8.2.0` and delete that member's pod **+** PVC to re-sync. See README "MongoDB version policy". |
 
 Have a browser tab with the README "Troubleshooting" section open as backup.

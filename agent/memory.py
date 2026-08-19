@@ -45,12 +45,20 @@ class MongoMemory:
         vector_index: str = "vector_index",
         text_index: str = "text_index",
         counters: Optional[Collection] = None,
+        ttl_seconds: int = 0,
+        max_turns_per_session: int = 0,
     ) -> None:
         self.collection = collection
         self.embeddings = embeddings
         self.reranker = reranker
         self.vector_index = vector_index
         self.text_index = text_index
+        # Memory-lifecycle controls. ``ttl_seconds`` <= 0 disables the TTL index
+        # (documents never auto-expire); ``max_turns_per_session`` <= 0 disables
+        # the per-session retention trim. Both default off so the demo keeps all
+        # history unless explicitly configured.
+        self.ttl_seconds = ttl_seconds
+        self.max_turns_per_session = max_turns_per_session
         # Per-session turn sequences live in a sibling collection so the counter
         # can be advanced atomically, independent of the message documents.
         self.counters = (
@@ -89,6 +97,7 @@ class MongoMemory:
         A precomputed ``embedding`` may be supplied to avoid re-embedding text
         that was already embedded for retrieval in the same turn.
         """
+        now = datetime.now(timezone.utc)
         document = {
             "_id": str(uuid.uuid4()),
             "session_id": session_id,
@@ -97,11 +106,34 @@ class MongoMemory:
             "embedding": embedding
             if embedding is not None
             else self.embeddings.embed_query(content),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            # ``timestamp`` is a human-readable ISO string kept for display and
+            # back-compat; ``created_at`` is a BSON Date so a TTL index can
+            # expire the document (TTL only acts on Date-typed fields).
+            "timestamp": now.isoformat(),
+            "created_at": now,
             "turn": self._next_turn(session_id),
         }
         self.collection.insert_one(document)
+        if self.max_turns_per_session > 0:
+            self._trim_session(session_id)
         return document
+
+    def _trim_session(self, session_id: str) -> None:
+        """Delete the oldest turns beyond ``max_turns_per_session`` for a session.
+
+        Best-effort retention: keeps the newest ``max_turns_per_session``
+        documents (by ``turn``) and removes older ones. Turn numbers keep
+        advancing regardless, so reads stay correctly ordered.
+        """
+        keep = self.max_turns_per_session
+        cursor = (
+            self.collection.find({"session_id": session_id}, {"_id": 1})
+            .sort([("turn", DESCENDING)])
+            .skip(keep)
+        )
+        stale = [d["_id"] for d in cursor]
+        if stale:
+            self.collection.delete_many({"_id": {"$in": stale}})
 
     def get_recent(self, session_id: str, n: int = 5) -> List[Dict[str, Any]]:
         """Return the last ``n`` turns in chronological order.
@@ -195,3 +227,36 @@ class MongoMemory:
             self.collection.create_index(keys, unique=True)
         except OperationFailure:
             self.collection.create_index(keys)
+        self._ensure_ttl_index()
+
+    def _ensure_ttl_index(self) -> None:
+        """Reconcile the TTL index on ``created_at`` with ``ttl_seconds``.
+
+        ``ttl_seconds`` > 0 creates (or re-expires) the index; ``<= 0`` drops
+        any existing one so disabling the TTL via config actually stops expiry.
+        Because MongoDB rejects an index rebuild that only changes
+        ``expireAfterSeconds``, an existing TTL index whose expiry differs is
+        dropped and recreated so the configured value always wins.
+        """
+        name = "created_at_ttl"
+        if self.ttl_seconds <= 0:
+            # Disabled: remove a previously-created TTL index if present.
+            try:
+                self.collection.drop_index(name)
+            except OperationFailure:
+                pass
+            return
+        try:
+            self.collection.create_index(
+                [("created_at", ASCENDING)],
+                name=name,
+                expireAfterSeconds=self.ttl_seconds,
+            )
+        except OperationFailure:
+            # An index with the same name but a different expiry already exists.
+            self.collection.drop_index(name)
+            self.collection.create_index(
+                [("created_at", ASCENDING)],
+                name=name,
+                expireAfterSeconds=self.ttl_seconds,
+            )

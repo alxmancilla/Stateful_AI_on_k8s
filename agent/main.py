@@ -9,6 +9,7 @@ the Azure Grove API, and persist both sides of the exchange to MongoDB.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -18,9 +19,11 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel
 
+import metrics
 from memory import MongoMemory, get_client
 from embeddings import VoyageEmbeddings
 from search import VoyageReranker
+from tools import build_tools
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -30,7 +33,11 @@ logger = logging.getLogger("agent.main")
 SYSTEM_PROMPT = (
     "You are a helpful assistant with persistent long-term memory stored in "
     "MongoDB. Use the retrieved context and recent conversation to answer "
-    "accurately and consistently. If the context is irrelevant, ignore it."
+    "accurately and consistently. If the context is irrelevant, ignore it. "
+    "You may call tools: search_memory to look up things the user told you "
+    "earlier, save_fact to remember a durable fact for later, and "
+    "get_current_time for the current time. Prefer answering directly when the "
+    "provided context already suffices."
 )
 
 
@@ -70,6 +77,9 @@ class Settings:
     recent_turns: int
     hybrid_top_k: int
     rerank_top_n: int
+    memory_ttl_seconds: int
+    max_turns_per_session: int
+    max_tool_iters: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -89,6 +99,9 @@ class Settings:
             recent_turns=int(os.environ.get("RECENT_TURNS", "5")),
             hybrid_top_k=int(os.environ.get("HYBRID_TOP_K", "10")),
             rerank_top_n=int(os.environ.get("RERANK_TOP_N", "3")),
+            memory_ttl_seconds=int(os.environ.get("MEMORY_TTL_SECONDS", "0")),
+            max_turns_per_session=int(os.environ.get("MAX_TURNS_PER_SESSION", "0")),
+            max_tool_iters=int(os.environ.get("MAX_TOOL_ITERS", "4")),
         )
 
 
@@ -146,7 +159,7 @@ def render_prompt(
 
 
 class Agent:
-    """Retrieval-augmented, MongoDB-backed conversational agent."""
+    """Retrieval-augmented, MongoDB-backed conversational agent with tools."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -158,17 +171,21 @@ class Agent:
             reranker=VoyageReranker(),
             vector_index=settings.vector_index,
             text_index=settings.text_index,
+            ttl_seconds=settings.memory_ttl_seconds,
+            max_turns_per_session=settings.max_turns_per_session,
         )
         self.memory.ensure_indexes()
         self.llm = build_llm(settings)
 
-    def respond(self, session_id: str, message: str) -> Dict[str, Any]:
+    def _prepare(self, session_id: str, message: str):
+        """Retrieve context and build the initial message list + tool binding.
+
+        Returns ``(messages, context, message_vector, tools, sinks, llm)`` where
+        ``llm`` is the tool-bound model. Retrieval is best-effort: on failure the
+        turn proceeds with recent turns only.
+        """
         recent = self.memory.get_recent(session_id, n=self.settings.recent_turns)
         context: List[Dict[str, Any]] = []
-        # Embed the user message once and reuse it for both retrieval and
-        # storage, avoiding a second Voyage call for identical text. If the
-        # embedding (or retrieval) fails, fall back to recent turns only and let
-        # save_message re-embed when persisting.
         message_vector: Optional[List[float]] = None
         try:
             message_vector = self.memory.embeddings.embed_query(message)
@@ -183,42 +200,182 @@ class Agent:
             )
         except Exception as exc:  # noqa: BLE001 - retrieval is best-effort
             logger.warning("Retrieval skipped (%s); using recent turns only", exc)
+            metrics.inc("agent_retrieval_skipped_total")
 
-        prompt = render_prompt(context=context, recent=recent, message=message)
-        reply = self.llm.invoke(prompt).content
+        messages = render_prompt(context=context, recent=recent, message=message)
+        tools, sinks = build_tools(self.memory, session_id)
+        llm = self.llm.bind_tools(tools)
+        return messages, context, message_vector, tools, sinks, llm
+
+    def _execute_tool_calls(self, tool_calls, tools):
+        """Run each requested tool call, returning ``(ToolMessages, events)``."""
+        from langchain_core.messages import ToolMessage
+
+        by_name = {t.name: t for t in tools}
+        tool_msgs, events = [], []
+        for call in tool_calls:
+            name, args = call["name"], call.get("args", {}) or {}
+            tool = by_name.get(name)
+            try:
+                out = tool.invoke(args) if tool else f"Unknown tool: {name}"
+            except Exception as exc:  # noqa: BLE001 - surface tool errors to model
+                out = f"Tool {name} failed: {exc}"
+            metrics.inc("agent_tool_calls_total", 1.0, tool=name)
+            tool_msgs.append(ToolMessage(content=str(out), tool_call_id=call["id"]))
+            events.append({"name": name, "args": args, "result": str(out)})
+        return tool_msgs, events
+
+    def _run_tool_loop(self, messages, tools, llm):
+        """Plan->act->observe until the model stops calling tools (bounded)."""
+        tool_events: List[Dict[str, Any]] = []
+        ai = llm.invoke(messages)
+        iters = 0
+        while getattr(ai, "tool_calls", None) and iters < self.settings.max_tool_iters:
+            messages.append(ai)
+            tool_msgs, events = self._execute_tool_calls(ai.tool_calls, tools)
+            messages.extend(tool_msgs)
+            tool_events.extend(events)
+            ai = llm.invoke(messages)
+            iters += 1
+        return ai.content, tool_events
+
+    def respond(self, session_id: str, message: str) -> Dict[str, Any]:
+        messages, context, message_vector, tools, sinks, llm = self._prepare(
+            session_id, message
+        )
+        reply, tool_events = self._run_tool_loop(messages, tools, llm)
 
         self.memory.save_message(session_id, "user", message, embedding=message_vector)
         self.memory.save_message(session_id, "assistant", reply)
-        return {"session_id": session_id, "reply": reply, "context_used": context}
+        metrics.inc("agent_messages_saved_total", 1.0, role="user")
+        metrics.inc("agent_messages_saved_total", 1.0, role="assistant")
+        return {
+            "session_id": session_id,
+            "reply": reply,
+            "context_used": context,
+            "tool_events": tool_events,
+        }
+
+    def stream_respond(self, session_id: str, message: str):
+        """Yield SSE event dicts for a turn: context, tool calls, then tokens.
+
+        Tool iterations run non-streamed (a tool-calling step has no user-facing
+        text); once the model stops requesting tools, the final answer is
+        streamed token-by-token. Each yielded item is ``{"type", "data"}``.
+        """
+        messages, context, message_vector, tools, sinks, llm = self._prepare(
+            session_id, message
+        )
+        yield {"type": "context", "data": context}
+
+        # Resolve tool calls first (bounded), emitting an event per call.
+        ai = llm.invoke(messages)
+        iters = 0
+        while getattr(ai, "tool_calls", None) and iters < self.settings.max_tool_iters:
+            messages.append(ai)
+            tool_msgs, events = self._execute_tool_calls(ai.tool_calls, tools)
+            messages.extend(tool_msgs)
+            for ev in events:
+                yield {"type": "tool", "data": ev}
+            ai = llm.invoke(messages)
+            iters += 1
+
+        # If the model already produced the final text (no more tool calls),
+        # stream a fresh generation of it so the UI still gets token events.
+        parts: List[str] = []
+        for chunk in llm.stream(messages):
+            piece = getattr(chunk, "content", "") or ""
+            if piece:
+                parts.append(piece)
+                yield {"type": "token", "data": piece}
+        reply = "".join(parts) or (ai.content if isinstance(ai.content, str) else "")
+
+        self.memory.save_message(session_id, "user", message, embedding=message_vector)
+        self.memory.save_message(session_id, "assistant", reply)
+        metrics.inc("agent_messages_saved_total", 1.0, role="user")
+        metrics.inc("agent_messages_saved_total", 1.0, role="assistant")
+        yield {"type": "done", "data": {"reply": reply, "context_used": context}}
 
 
 def build_app(agent: Agent):
     from fastapi import FastAPI
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
 
     app = FastAPI(title="Stateful AI Agent")
+
+    # Static demo UI. ``static/`` ships in the image next to this module; the
+    # directory check keeps the app importable in environments (e.g. tests)
+    # where the assets are absent.
+    static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+    index_file = os.path.join(static_dir, "index.html")
+    if os.path.isdir(static_dir):
+        app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+        @app.get("/")
+        def index():
+            return FileResponse(index_file)
 
     @app.get("/health")
     def health() -> Dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/metrics")
+    def metrics_endpoint():
+        from fastapi.responses import PlainTextResponse
+
+        return PlainTextResponse(metrics.render())
+
     @app.post("/chat")
     def chat(req: ChatRequest) -> Dict[str, Any]:
-        return agent.respond(req.session_id, req.message)
+        try:
+            result = agent.respond(req.session_id, req.message)
+        except Exception:
+            metrics.inc("agent_requests_total", 1.0, route="chat", outcome="error")
+            raise
+        metrics.inc("agent_requests_total", 1.0, route="chat", outcome="ok")
+        return result
+
+    @app.post("/chat/stream")
+    def chat_stream(req: ChatRequest):
+        from fastapi.responses import StreamingResponse
+
+        def sse():
+            try:
+                for event in agent.stream_respond(req.session_id, req.message):
+                    yield f"event: {event['type']}\ndata: {json.dumps(event['data'])}\n\n"
+            except Exception as exc:  # noqa: BLE001 - report to the client stream
+                metrics.inc("agent_requests_total", 1.0, route="chat_stream", outcome="error")
+                yield f"event: error\ndata: {json.dumps(str(exc))}\n\n"
+                return
+            metrics.inc("agent_requests_total", 1.0, route="chat_stream", outcome="ok")
+
+        return StreamingResponse(sse(), media_type="text/event-stream")
 
     @app.post("/search")
     def search(req: SearchRequest) -> Dict[str, Any]:
-        if req.mode == "vector":
-            results = agent.memory.semantic_search(req.session_id, req.query, req.top_k)
-        else:
-            results = agent.memory.hybrid_search(req.session_id, req.query, req.top_k)
+        try:
+            if req.mode == "vector":
+                results = agent.memory.semantic_search(req.session_id, req.query, req.top_k)
+            else:
+                results = agent.memory.hybrid_search(req.session_id, req.query, req.top_k)
+        except Exception:
+            metrics.inc("agent_requests_total", 1.0, route="search", outcome="error")
+            raise
+        metrics.inc("agent_requests_total", 1.0, route="search", outcome="ok")
         return {"mode": req.mode, "results": results}
 
     @app.post("/rerank")
     def rerank(req: SearchRequest) -> Dict[str, Any]:
-        candidates = agent.memory.hybrid_search(req.session_id, req.query, req.top_k)
-        reranked = agent.memory.rerank(
-            req.query, candidates, top_n=agent.settings.rerank_top_n
-        )
+        try:
+            candidates = agent.memory.hybrid_search(req.session_id, req.query, req.top_k)
+            reranked = agent.memory.rerank(
+                req.query, candidates, top_n=agent.settings.rerank_top_n
+            )
+        except Exception:
+            metrics.inc("agent_requests_total", 1.0, route="rerank", outcome="error")
+            raise
+        metrics.inc("agent_requests_total", 1.0, route="rerank", outcome="ok")
         return {"before": candidates, "after": reranked}
 
     @app.get("/memory/{session_id}")

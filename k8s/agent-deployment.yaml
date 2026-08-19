@@ -15,6 +15,11 @@ spec:
     metadata:
       labels:
         app: stateful-agent
+      annotations:
+        # Advertise the /metrics endpoint for Prometheus pod discovery.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
     spec:
       containers:
         - name: agent

@@ -150,6 +150,112 @@ def test_unique_index_rejects_duplicate_turn(memory):
         )
 
 
+def test_save_message_sets_created_at_date(memory):
+    from datetime import datetime
+
+    doc = memory.save_message("date-session", "user", "hello")
+    stored = memory.collection.find_one({"_id": doc["_id"]})
+    # created_at must be a BSON Date (datetime) so a TTL index can act on it;
+    # timestamp stays a display string.
+    assert isinstance(stored["created_at"], datetime)
+    assert isinstance(stored["timestamp"], str)
+
+
+def test_retention_trim_keeps_newest_turns():
+    """With max_turns_per_session set, only the newest N turns survive."""
+    client, _ = _make_client()
+    db = client["agent_memory_test"]
+    suffix = uuid.uuid4().hex[:8]
+    mem = MongoMemory(
+        collection=db[f"messages_{suffix}"],
+        embeddings=_StubEmbeddings(),
+        reranker=_StubReranker(),
+        counters=db[f"counters_{suffix}"],
+        max_turns_per_session=3,
+    )
+    mem.ensure_indexes()
+    try:
+        sid = "trim-session"
+        for i in range(6):
+            mem.save_message(sid, "user", f"msg {i}")
+        recent = mem.get_recent(sid, n=100)
+        assert [m["turn"] for m in recent] == [3, 4, 5]
+    finally:
+        mem.collection.drop()
+        mem.counters.drop()
+
+
+def _ttl_index(collection):
+    return next(
+        (ix for ix in collection.list_indexes() if "expireAfterSeconds" in ix),
+        None,
+    )
+
+
+def test_ttl_index_reconciles_with_config():
+    """Enabling builds the TTL index; disabling drops it again."""
+    client, _ = _make_client()
+    db = client["agent_memory_test"]
+    suffix = uuid.uuid4().hex[:8]
+    coll = db[f"messages_{suffix}"]
+    counters = db[f"counters_{suffix}"]
+
+    def build(ttl):
+        m = MongoMemory(
+            collection=coll,
+            embeddings=_StubEmbeddings(),
+            reranker=_StubReranker(),
+            counters=counters,
+            ttl_seconds=ttl,
+        )
+        m.ensure_indexes()
+        return m
+
+    try:
+        build(0)
+        assert _ttl_index(coll) is None
+        build(90)
+        ix = _ttl_index(coll)
+        assert ix is not None and ix["expireAfterSeconds"] == 90
+        # Disabling must remove the index so expiry actually stops.
+        build(0)
+        assert _ttl_index(coll) is None
+    finally:
+        coll.drop()
+        counters.drop()
+
+
+def test_agent_tools_execute_and_record(memory):
+    """The bound tools search memory, save facts, and record structured sinks.
+
+    Requires langchain_core (present in the agent image / CI). Skips offline so
+    the rest of the suite stays hermetic.
+    """
+    pytest.importorskip("langchain_core")
+    from tools import build_tools
+
+    sid = "tools-session"
+    memory.save_message(sid, "user", "My favorite language is Rust.")
+    tools, sinks = build_tools(memory, sid)
+    by_name = {t.name: t for t in tools}
+
+    assert set(by_name) == {"search_memory", "save_fact", "get_current_time"}
+
+    out = by_name["search_memory"].invoke({"query": "favorite language"})
+    assert "Rust" in out
+    assert sinks["retrieved"], "search_memory should record retrieved docs"
+
+    saved = by_name["save_fact"].invoke({"fact": "User prefers dark mode."})
+    assert "dark mode" in saved
+    assert sinks["saved_facts"] == ["User prefers dark mode."]
+    # The fact is persisted as a system turn and is retrievable.
+    stored = memory.get_recent(sid, n=100)
+    assert any("FACT: User prefers dark mode." in m["content"] for m in stored)
+
+    now = by_name["get_current_time"].invoke({})
+    assert "T" in now  # ISO 8601
+
+
 def test_get_recent_clamps_n(memory):
     sid = "clamp-session"
     total = MAX_RECENT + 5

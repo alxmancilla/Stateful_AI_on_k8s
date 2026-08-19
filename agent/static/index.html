@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Stateful AI Agent — MongoDB demo</title>
+<style>
+  :root {
+    --forest: #00684A; --spring: #00ED64; --slate: #001E2B;
+    --mist: #E3FCF7; --gray: #5C6C75; --line: #E8EDEB; --canvas: #F9FBFA;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--slate); background: var(--canvas); }
+  header { background: var(--slate); color: #fff; padding: 14px 20px; display: flex;
+    align-items: center; gap: 12px; }
+  header .leaf { width: 22px; height: 22px; background: var(--spring);
+    clip-path: polygon(50% 0, 85% 55%, 50% 100%, 15% 55%); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .sid { margin-left: auto; font-size: 12px; color: #C1C7C6; }
+  header .sid input { background: #0b2b38; border: 1px solid #12414f; color: #fff;
+    border-radius: 6px; padding: 5px 8px; font-size: 12px; width: 160px; }
+  .wrap { max-width: 960px; margin: 0 auto; padding: 18px; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+  .tabs button { border: 1px solid var(--line); background: #fff; color: var(--gray);
+    padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600; }
+  .tabs button.active { background: var(--forest); color: #fff; border-color: var(--forest); }
+  .card { background: #fff; border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px; box-shadow: 0 1px 2px rgba(0,30,43,.04); }
+  .panel { display: none; } .panel.active { display: block; }
+  .row { display: flex; gap: 8px; }
+  input[type=text] { flex: 1; padding: 11px 12px; border: 1px solid var(--line);
+    border-radius: 8px; font-size: 14px; }
+  input[type=text]:focus, header .sid input:focus { outline: 2px solid var(--spring); }
+  .btn { background: var(--spring); color: var(--slate); border: none; border-radius: 8px;
+    padding: 0 18px; font-weight: 700; cursor: pointer; font-size: 14px; }
+  .btn:disabled { opacity: .5; cursor: default; }
+  select { padding: 10px; border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
+  #log { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px;
+    max-height: 46vh; overflow-y: auto; }
+  .msg { padding: 10px 13px; border-radius: 12px; max-width: 78%; font-size: 14px;
+    line-height: 1.4; white-space: pre-wrap; }
+  .msg.user { align-self: flex-end; background: var(--forest); color: #fff;
+    border-bottom-right-radius: 4px; }
+  .msg.assistant { align-self: flex-start; background: var(--mist); color: var(--slate);
+    border-bottom-left-radius: 4px; }
+  .ctx { font-size: 11px; color: var(--gray); margin-top: 4px; }
+  .item { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px;
+    margin-bottom: 8px; font-size: 13px; }
+  .item .meta { display: flex; gap: 10px; color: var(--gray); font-size: 11px;
+    margin-bottom: 4px; text-transform: uppercase; letter-spacing: .3px; }
+  .pill { background: var(--mist); color: var(--forest); border-radius: 20px;
+    padding: 1px 8px; font-weight: 700; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .cols h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .5px;
+    color: var(--gray); margin: 0 0 8px; }
+  .hint { color: var(--gray); font-size: 12px; margin: 4px 0 12px; }
+  .empty { color: var(--gray); font-size: 13px; padding: 8px 0; }
+  .sources { margin-top: 8px; font-size: 12px; }
+  .sources summary { cursor: pointer; color: var(--forest); font-weight: 700; }
+  .sources .item { margin-top: 8px; background: var(--canvas); }
+  .sources code { background: #EEF3F1; padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="leaf"></div>
+  <h1>Stateful AI Agent</h1>
+  <div class="sid">session&nbsp;
+    <input id="sid" type="text" value="demo" spellcheck="false" />
+  </div>
+</header>
+<div class="wrap">
+  <div class="tabs">
+    <button data-tab="chat" class="active">Chat</button>
+    <button data-tab="search">Search</button>
+    <button data-tab="rerank">Rerank</button>
+  </div>
+
+  <div id="chat" class="panel active card">
+    <div id="log"></div>
+    <div class="row">
+      <input id="chatInput" type="text" placeholder="Tell the agent something, or ask it to recall…" />
+      <button id="chatSend" class="btn">Send</button>
+    </div>
+  </div>
+
+  <div id="search" class="panel card">
+    <p class="hint">Retrieval only — compare hybrid ($rankFusion) vs. pure vector search.</p>
+    <div class="row">
+      <input id="searchInput" type="text" placeholder="Query the session's memory…" />
+      <select id="searchMode"><option value="hybrid">hybrid</option><option value="vector">vector</option></select>
+      <button id="searchSend" class="btn">Search</button>
+    </div>
+    <div id="searchOut" style="margin-top:14px"></div>
+  </div>
+
+  <div id="rerank" class="panel card">
+    <p class="hint">Voyage reranker re-scores hybrid candidates — watch the order change.</p>
+    <div class="row">
+      <input id="rerankInput" type="text" placeholder="Query to rerank…" />
+      <button id="rerankSend" class="btn">Rerank</button>
+    </div>
+    <div class="cols" style="margin-top:14px">
+      <div><h3>Before (hybrid)</h3><div id="rerankBefore"></div></div>
+      <div><h3>After (reranked)</h3><div id="rerankAfter"></div></div>
+    </div>
+  </div>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
